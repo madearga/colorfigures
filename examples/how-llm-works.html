@@ -1,0 +1,823 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>
+<script>
+/* ============================================================
+   Colorfigures core: projection, shapes, shading, ink, labels, page shell.
+   A figure page includes this file (scripts/build.py inlines it), then calls mountFigure({...}).
+   See SKILL.md for the drawing contract and conventions.
+   One fixed view (front-left-top) and one fixed light (from above, behind the viewer's right shoulder: the front is lit,
+   the left side is in shade, and cast shadows fall toward the lower left of the screen).
+   ============================================================ */
+
+/* ---------- palettes ---------- */
+const PALS = {
+  mustard: { l:'#f4b829', m:'#d49c1f', d:'#4e4a18' },
+  tomato:  { l:'#ef6a4c', m:'#cf5038', d:'#4a2219' },
+  mint:    { l:'#93d3b0', m:'#71b693', d:'#1f4034' },
+  cobalt:  { l:'#76a0e2', m:'#5a82c6', d:'#1c2948' },
+  blush:   { l:'#f3a6bb', m:'#d8869c', d:'#4b2430' },
+};
+const METAL   = { l:'#eef0f0', m:'#c6ccce', d:'#8f989b' };
+const CLEAR   = { l:'#e4f2f4', m:'#c4dfe4', d:'#97b9c0' };
+const CERAMIC = { l:'#fbfaf3', m:'#e3e0d2', d:'#bdb8a6' };
+const DARK    = { l:'#55504a', m:'#3d3935', d:'#272421' };
+const INK = '#231e16';
+const SHADOW = '#41538f';
+
+/* ---------- projection (x = depth toward viewer-right, y = toward viewer-left, z = up) ---------- */
+const C = Math.cos(Math.PI/6), S = Math.sin(Math.PI/6);
+let OX = 0, OY = 0;
+/* VIEW turns the object in 90° steps about a vertical axis through its centre (RC):
+   0 = front (+x) and left (+y) faces toward the viewer, 1 = turned once (the +y side becomes the front)…
+   Figures keep modelling in their own coordinates; P / Dv / vis / tone / depthOf all apply the turn. */
+let VIEW = 0, RC = [0, 0];
+const VIEW_NAMES = ['front', 'left side', 'back', 'right side'];
+const TURNS = [0, 2];                 // the views the UI offers: front and back (figures still draw correctly in all four)
+const rotV = ([x,y,z]) => { switch (VIEW & 3){ case 1: return [y,-x,z]; case 2: return [-x,-y,z]; case 3: return [-y,x,z]; default: return [x,y,z]; } };
+const rotXY = (x,y) => { const r = rotV([x-RC[0], y-RC[1], 0]); return [r[0]+RC[0], r[1]+RC[1]]; };
+const P0 = (x,y,z) => [(x-y)*C + OX, (x+y)*S - z + OY];                       // raw iso, no turn
+const P  = (x,y,z) => { const [a,b] = rotXY(x,y); return [(a-b)*C + OX, (a+b)*S - z + OY]; };
+const Dv = (x,y,z) => { const [a,b,c] = rotV([x,y,z]); return [(a-b)*C, (a+b)*S - c]; };
+// distance toward the viewer in the current view: draw parts with smaller depth first
+const depthOf = p => { const [a,b] = rotXY(p[0],p[1]); return a + b + p[2]; };
+// sort [{at:[x,y,z], svg}] back-to-front for the current view and join
+const byDepth = parts => parts.filter(Boolean).sort((p,q) => depthOf(p.at) - depthOf(q.at)).map(p => p.svg).join('');
+const f  = v => v.toFixed(1);
+const pd = (pts, close=true) => 'M' + pts.map(p => { const q = P(p[0],p[1],p[2]); return f(q[0])+' '+f(q[1]); }).join('L') + (close ? 'Z' : '');
+const sp = pts => 'M' + pts.map(q => f(q[0])+' '+f(q[1])).join('L') + 'Z';
+
+/* ---------- 2D shapes in a plane's (u,v) coords (v up), mapped to 3D by a plane ---------- */
+const arcUV  = (cu,cv,r,a0,a1,n=7) => { const o=[]; for (let i=0;i<=n;i++){ const a=(a0+(a1-a0)*i/n)*Math.PI/180; o.push([cu+r*Math.cos(a), cv+r*Math.sin(a)]); } return o; };
+const rrUV   = (u0,v0,u1,v1,r,n=7) => r <= 0 ? rectUV(u0,v0,u1,v1) : [...arcUV(u1-r,v0+r,r,-90,0,n), ...arcUV(u1-r,v1-r,r,0,90,n), ...arcUV(u0+r,v1-r,r,90,180,n), ...arcUV(u0+r,v0+r,r,180,270,n)];
+const rectUV = (u0,v0,u1,v1) => [[u0,v0],[u1,v0],[u1,v1],[u0,v1]];
+const ellUV  = (cu,cv,ru,rv,n=24) => Array.from({length:n}, (_,i) => { const a=i/n*2*Math.PI; return [cu+ru*Math.cos(a), cv+rv*Math.sin(a)]; });
+const PX = x => ([u,v]) => [x,u,v];      // front-facing plane x = const   (u = y, v = z)
+const PY = y => ([u,v]) => [u,y,v];      // side plane y = const           (u = x, v = z)
+const PZ = z => ([u,v]) => [u,v,z];      // horizontal plane z = const     (u = x, v = y)
+const on = (plane, uv) => uv.map(plane);
+
+/* ---------- vectors + shading ---------- */
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm=a=>{ const l=Math.hypot(...a)||1; return a.map(v=>v/l); };
+const avg=ps=>ps.reduce((s,p)=>[s[0]+p[0]/ps.length,s[1]+p[1]/ps.length,s[2]+p[2]/ps.length],[0,0,0]);
+const vis = n => { const r = rotV(n); return r[0]+r[1]+r[2] > 1e-6; };   // viewer looks from (+1,+1,+1) after the turn
+const facing = vis;                                                       // readable alias: is this face toward the viewer?
+const SHADOW_K = 0.85, AZ_MIN = 20, AZ_MAX = 160;
+// cast shadows are drawn shorter than the shading light implies (0.45 × height instead of 0.85 ×): long shadows of tall
+// parts on thin supports (a lamp shade, a fan head) land far from the object and read as separate blobs
+const SHADOW_LEN = 0.45;
+let L = [0,0,1], SH = [0,0];
+function setLight(deg){ const a=deg*Math.PI/180; SH=[SHADOW_K*Math.cos(a), SHADOW_K*Math.sin(a)]; L=norm([-SH[0],-SH[1],1]); }
+const LIN = norm([.6,.2,1]);                       // fixed light for interiors / small props
+const tone  = (n,m) => { const d=dot(rotV(n),L);   return d>-.15 ? m.l : d>-.45 ? m.m : m.d; };   // exterior, follows the sun
+const toneI = (n,m) => { const d=dot(rotV(n),LIN); return d>.6 ? m.l : d>.05 ? m.m : m.d; };      // interior / props
+const mix = (a,b,t) => '#' + [1,3,5].map(i => Math.round(parseInt(a.substr(i,2),16)*(1-t) + parseInt(b.substr(i,2),16)*t).toString(16).padStart(2,'0')).join('');
+const matOf = hex => ({ l:hex, m:mix(hex,'#000000',.16), d:mix(hex,'#000000',.42) });
+const ease = t => t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;
+
+/* ---------- drawing primitives (all return SVG strings) ---------- */
+const ink   = (d,w=1.0) => `<path d="${d}" fill="none" stroke="${INK}" stroke-width="${w}" stroke-linejoin="round" stroke-linecap="round"/>`;
+const fill  = (d,c,extra='') => `<path d="${d}" fill="${c}" ${extra}/>`;
+const face  = (d,c) => `<path d="${d}" fill="${c}" stroke="${c}" stroke-width=".7" stroke-linejoin="round"/>`;
+const shape = (pts,c,w=.9) => fill(pd(pts),c) + (w ? ink(pd(pts),w) : '');
+const line  = (pts,w=.9) => ink(pd(pts,false),w);
+// Loft between two rings of equal length (closed). colour(n) picks each strip's fill; flip = seen from inside.
+function loft(A, B, colour, flip=false){
+  const n=A.length, cen=avg(A.concat(B)); let s='';
+  for (let i=0;i<n;i++){
+    const a0=A[i], a1=A[(i+1)%n], b1=B[(i+1)%n], b0=B[i];
+    let nr = norm(cross(sub(a1,a0), sub(b0,a0)));
+    if (!isFinite(nr[0])) continue;
+    if (dot(nr, sub(avg([a0,a1,b1,b0]), cen)) < 0) nr = nr.map(v=>-v);
+    if (flip) nr = nr.map(v=>-v);
+    if (vis(nr)) s += face(pd([a0,a1,b1,b0]), colour(nr));
+  }
+  return s;
+}
+function hull(pts){
+  pts = pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]); const lo=[], up=[];
+  for (const p of pts){ while(lo.length>=2 && cr(lo[lo.length-2],lo[lo.length-1],p)<=0) lo.pop(); lo.push(p); }
+  for (const p of pts.reverse()){ while(up.length>=2 && cr(up[up.length-2],up[up.length-1],p)<=0) up.pop(); up.push(p); }
+  lo.pop(); up.pop(); return lo.concat(up);
+}
+// Silhouette ink, weighted by how thick the part is on screen (like a hand inker): the w you pass is the most it gets.
+// Thickness = 2 × area / perimeter of the outline (a rod's diameter, about half a box's width), as a share of the
+// frame width. A long thin rod, a handle or a knob stays light (~1–1.5); a grinder, kettle or machine body gets the
+// heavy ~2.4–2.8. Thin parts stay thin and parts keep air between them.
+const hullInk = (pts3, w=1.4) => { const h = hull(pts3.map(p=>P(...p))); let a = 0, per = 0;
+  for (let i = 0; i < h.length; i++){ const p = h[i], q = h[(i+1) % h.length]; a += p[0]*q[1] - q[0]*p[1]; per += Math.hypot(q[0]-p[0], q[1]-p[1]); }
+  const thick = per ? Math.abs(a) / per / (INK_K * INK_REF_VB) : 0;
+  return ink(sp(h), Math.min(w, .9 + 20*thick)); };
+// Axis-aligned box: three visible faces, shaded, each outlined. shade = tone (sunlit) or toneI (interior).
+function box(x0,y0,z0,x1,y1,z1,m,shade=toneI,w=.9){
+  // all six faces, drawn only when they face the viewer (sides first, then top) — correct in every VIEW
+  const F = [
+    [[0,1,0],  [[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]]],
+    [[1,0,0],  [[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]]],
+    [[0,-1,0], [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]]],
+    [[-1,0,0], [[x0,y0,z0],[x0,y1,z0],[x0,y1,z1],[x0,y0,z1]]],
+    [[0,0,1],  [[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]]] ];
+  return F.filter(([n]) => vis(n)).map(([n,q]) => shape(q, shade(n,m), w)).join('');
+}
+// Rounded-profile extrusion: profile (u=y, v=z) swept along x from x0 to x1. Body of most machines.
+function extrude(profileUV, x0, x1, m, shade=tone){ return loft(on(PX(x0),profileUV), on(PX(x1),profileUV), n=>shade(n,m)); }
+// Vertical cylinder (axis z) centred (x,y), radius r from z0 to z1, with top cap.
+function cyl(x,y,z0,z1,r,m,shade=toneI,w=1.2,n=24){
+  const A=on(PZ(z0),ellUV(x,y,r,r,n)), B=on(PZ(z1),ellUV(x,y,r,r,n));
+  return loft(A,B,nr=>shade(nr,m)) + fill(pd(B),shade([0,0,1],m)) + hullInk([...A,...B],w) + ink(pd(B),w*.8);
+}
+// Cylinder lying along x (e.g. a knob or dial sticking out of a front face): centred (y,z), from x0 to x1.
+function cylX(x0,x1,y,z,r,m,shade=toneI,w=1.1,n=20){
+  const A=on(PX(x0),ellUV(y,z,r,r,n)), B=on(PX(x1),ellUV(y,z,r,r,n));
+  // cap on whichever end faces the viewer (the +x end in VIEW 0)
+  const capB = vis([1,0,0]), cap = capB ? B : A, cn = capB ? [1,0,0] : [-1,0,0];
+  return loft(A,B,nr=>shade(nr,m)) + (vis(cn) ? fill(pd(cap),shade(cn,m)) : '') + hullInk([...A,...B],w) + (vis(cn) ? ink(pd(cap),w*.8) : '');
+}
+// Cylinder between any two 3D points a and b (a lamp arm, a rod, a pipe at an angle, a handle bar), radius r.
+// The end facing the viewer gets a cap. For a tapered part (a cone, a lamp shade) pass r1 for the radius at b.
+function rod(a, b, r, m, shade=toneI, w=1, r1=r, n=16){
+  const d = norm(sub(b, a)), u = norm(cross(d, Math.abs(d[2]) < .9 ? [0,0,1] : [1,0,0])), v = cross(d, u);
+  const ring = (p, rr) => Array.from({length:n}, (_,i) => { const t = i/n*2*Math.PI, c = Math.cos(t)*rr, s2 = Math.sin(t)*rr;
+    return [p[0] + u[0]*c + v[0]*s2, p[1] + u[1]*c + v[1]*s2, p[2] + u[2]*c + v[2]*s2]; });
+  const A = ring(a, r), B = ring(b, r1), capB = vis(d), cap = capB ? B : A, cn = capB ? d : d.map(x => -x);
+  return loft(A, B, nr => shade(nr, m)) + (Math.max(r, r1) > 0 ? fill(pd(cap), shade(cn, m)) + ink(pd(cap), w*.8) : '') + hullInk([...A, ...B], w);
+}
+// Text lying flat on a front plane x = const, centred at (y,z) baseline; reads left-to-right on screen.
+const txM = (o, U, V) => `matrix(${U[0].toFixed(4)} ${U[1].toFixed(4)} ${V[0].toFixed(4)} ${V[1].toFixed(4)} ${f(o[0])} ${f(o[1])})`;
+const tx = (x,y,z,str,size,col=INK,weight=700) => { const o=P(x,y,z);
+  return `<text transform="${txM(o, Dv(0,-1,0), Dv(0,0,-1))}" font-size="${size}" fill="${col}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="${weight}" letter-spacing=".04em">${str}</text>`; };
+// Text on a side plane y = const, centred at (x,z).
+const txY = (x,y,z,str,size,col=INK,weight=700) => { const o=P(x,y,z);
+  return `<text transform="${txM(o, Dv(1,0,0), Dv(0,0,-1))}" font-size="${size}" fill="${col}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="${weight}" letter-spacing=".04em">${str}</text>`; };
+// Cast shadow of a set of 3D points (any outline of the object), pushed along the light onto z = 0.
+// the light stays put relative to the viewer, so the shadow is cast in turned coordinates
+// z0: the surface it falls on (a board, a counter); clip it to that surface with clipTo(...) if it could spill off.
+// clip: the 3D outline of the surface it falls on (e.g. boardTop(...)), so it can't spill over the edge.
+const castShadow = (pts3, z0=0, clip=null) => { const k = SHADOW_LEN / SHADOW_K;
+  const s = fill(sp(hull(pts3.map(([x,y,z]) => { const [a,b] = rotXY(x,y); return P0(a+(z-z0)*SH[0]*k, b+(z-z0)*SH[1]*k, z0); }))), SHADOW);
+  return clip ? clipTo(clip, s) : s; };
+// A board for the object to stand on (a tray, a desk top, a counter): a rounded slab from (x0,y0) to (x1,y1), h thick.
+// Draw it first; then castShadow(points, h, boardTop(x0,y0,x1,y1,h,r)) so shadows lie on it and stop at its edge.
+const BOARD = { l:'#e6e1d4', m:'#cfc8b8', d:'#aaa293' }, WOOD = { l:'#d9a86c', m:'#bf8a4f', d:'#8e6236' };
+const boardTop = (x0,y0,x1,y1,h=3,r=5) => on(PZ(h), rrUV(x0,y0,x1,y1,r));
+function board(x0,y0,x1,y1,h=3,r=5,m=BOARD){
+  const A = on(PZ(0), rrUV(x0,y0,x1,y1,r)), B = boardTop(x0,y0,x1,y1,h,r);
+  return loft(A, B, n => toneI(n, m)) + fill(pd(B), m.l) + ink(pd(B), 1) + hullInk([...A, ...B], 1.8);
+}
+// Group helpers: clickable target, clip to an opening.
+const act  = (name, inner, data='') => `<g data-act="${name}" ${data}>${inner}</g>`;
+let _clipN = 0;
+// Part label (for "how does it work" figures): a cream pill with a leader line to a 3D point on the part.
+// dx, dy = where the pill sits, in screen units at the reference zoom (they scale with the figure like stroke widths).
+// on = that part is working right now (the pill turns the accent colour). Labels can be hidden with the Labels switch.
+function tag(p3, dx, dy, text, on=false){
+  const k = INK_K, [X,Y] = P(...p3), fs = 8.6*k, w = text.length*fs*.62 + fs*1.5, h = fs*1.8, cx = X + dx*k, cy = Y + dy*k;
+  return `<g class="tag${on ? ' on' : ''}"><path d="M${f(X)} ${f(Y)}L${f(cx)} ${f(cy)}" fill="none" stroke="${INK}" stroke-width="1"/>`
+    + `<circle cx="${f(X)}" cy="${f(Y)}" r="${f(1.3*k)}" fill="${INK}"/>`
+    + `<rect x="${f(cx-w/2)}" y="${f(cy-h/2)}" width="${f(w)}" height="${f(h)}" rx="${f(h/2)}" fill="${on ? 'var(--accent,#f4b829)' : '#fff4d6'}" stroke="${INK}" stroke-width="1.2"/>`
+    + `<text x="${f(cx)}" y="${f(cy+fs*.36)}" font-size="${f(fs)}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="800" letter-spacing=".04em" fill="${INK}">${text}</text></g>`;
+}
+const clipTo = (pts3, inner) => { const id = 'k' + (++_clipN); return `<clipPath id="${id}"><path d="${pd(pts3)}"/></clipPath><g clip-path="url(#${id})">${inner}</g>`; };
+
+/* ---------- constant on-screen line weight ----------
+   Stroke widths are written in model units, and each figure is zoomed to fill the frame, so a small
+   object would get fat lines. INK_K rescales every stroke-width (and the wobble/grain filter) so all
+   figures match the reference zoom of the booth / vending machine (viewBox ≈ 585 units wide). */
+const INK_REF_VB = 585;
+let INK_K = 1;
+const inkScale = svg => INK_K === 1 ? svg : svg.replace(/stroke-width="([\d.]+)"/g, (_, w) => `stroke-width="${(+w * INK_K).toFixed(2)}"`);
+
+/* ---------- page shell ---------- */
+const CORE_CSS = `
+  :root{--paper:#f2efe7;--ink:#231e16;--muted:#857d6e;--rule:#ddd6c8}
+  *{box-sizing:border-box} html,body{margin:0;height:100%}
+  body{background-color:var(--paper);
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'><filter id='p'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .42  0 0 0 0 .39  0 0 0 0 .33  .16 0 0 0 0'/></filter><rect width='100%' height='100%' filter='url(%23p)'/></svg>");
+    overflow-x:hidden;color:var(--ink);font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;display:flex;flex-direction:column;align-items:center;padding:24px 16px 32px}
+  header{width:100%;max-width:760px;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{font-size:13px;font-weight:600;margin:0;letter-spacing:.02em} header span{color:var(--muted)}
+  #fig{width:100%;max-width:760px;height:auto;display:block;margin:4px 0 8px;user-select:none;overflow:visible}
+  #fig [data-act]{cursor:pointer}
+  #readout, .idea{display:none}   /* status line + big idea are off: the buttons and motion tell the story */
+  .idea{width:100%;max-width:760px;margin:-6px 0 16px;font-size:12.5px;line-height:1.5;text-align:center;color:var(--ink)}
+  .idea strong{letter-spacing:.12em;text-transform:uppercase;font-size:11px;margin-right:8px}
+  #readout{position:relative;min-height:1.4em;letter-spacing:.08em;text-transform:uppercase;margin-bottom:14px;text-align:center;text-shadow:0 0 3px var(--paper),0 0 6px var(--paper),0 0 10px var(--paper)}
+  .stage{position:relative;width:100%;max-width:760px}
+  .actions{position:absolute;top:4px;left:0;display:flex;flex-direction:column;align-items:flex-start;gap:8px;z-index:2;max-width:220px}
+  .actions .cap{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 2px}
+  html.nolabels #fig .tag{display:none}
+  .ctl[hidden]{display:none}
+  /* ui.flash(text): a short note under the buttons ("the can is empty — refill it"); the status line itself stays hidden */
+  .toast{position:absolute;left:0;z-index:3;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;background:var(--paper);
+    border:1.5px solid var(--ink);border-radius:8px;padding:4px 9px;box-shadow:2px 2px 0 var(--ink);opacity:0;transition:opacity .2s;pointer-events:none;max-width:240px}
+  .toast.show{opacity:1}
+  .made-with{width:100%;max-width:760px;margin-top:18px;text-align:right;font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+  .made-with a{color:var(--muted);text-decoration:none} .made-with a:hover{color:var(--ink)}
+  .stats{position:absolute;top:4px;right:0;display:flex;flex-direction:column;align-items:flex-end;gap:10px;z-index:2;text-align:right}
+  .stat .k{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .stat .v{font-size:34px;font-weight:800;line-height:1.05;letter-spacing:-.01em;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .stat.small .v{font-size:20px}
+  .stat .v.bump{animation:bump .35s ease-out}
+  @keyframes bump{0%{transform:scale(1.18)}100%{transform:none}}
+  .stepwrap{position:relative;display:flex;align-items:center;gap:8px}
+  .act{font:inherit;color:var(--ink);background:var(--paper);border:1.5px solid var(--ink);border-radius:999px;padding:5px 14px;cursor:pointer;white-space:nowrap}
+  .act:hover{background:color-mix(in srgb,var(--paper) 92%,var(--ink))}
+  .act .car{margin-left:6px;font-size:10px}
+  .act:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+  .chips{display:none;flex-wrap:wrap;gap:6px;background:var(--paper);border:2px solid var(--ink);border-radius:12px;box-shadow:3px 3px 0 var(--ink);
+    padding:8px;width:max-content;max-width:min(300px,62vw);position:absolute;left:calc(100% + 10px);top:-4px;z-index:3}
+  .stepwrap.open .chips{display:flex}
+  .chip{white-space:nowrap;font:inherit;font-size:11.5px;font-weight:700;color:var(--ink);background:var(--paper);border:1.5px solid var(--ink);border-radius:8px;padding:4px 8px;cursor:pointer;box-shadow:2px 2px 0 var(--ink)}
+  .chip:hover{background:var(--accent,#f4b829);transform:translate(-1px,-1px)}
+  .chip.current{background:var(--ink);color:var(--paper)} .chip.current:hover{background:var(--ink);transform:none}
+  .chip.off{opacity:.45} .chip.off:hover{transform:none;background:var(--paper)}
+  
+  @media (max-width:560px){body{padding:14px 12px 24px}header span,.actions .cap{display:none}.actions{flex-direction:row;flex-wrap:wrap;gap:6px}.act{font-size:12px;padding:4px 11px}.stats{position:static;flex-direction:row;justify-content:flex-end;gap:18px;margin-bottom:4px}.actions{position:static;max-width:none;margin:6px 0 4px}.chips{left:0;top:calc(100% + 8px)}}
+  .controls{width:100%;max-width:760px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px 28px;border-top:1px solid var(--rule);padding-top:16px}
+  .ctl{display:flex;flex-direction:column;gap:6px}
+  .ctl label{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+  input[type=range]{width:100%;accent-color:var(--ink)}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button{font:inherit;color:var(--ink);background:transparent;border:1.5px solid var(--ink);border-radius:999px;padding:5px 14px;cursor:pointer}
+  button:hover{background:#0000000d}
+  .sw{width:26px;height:26px;padding:0;border-radius:50%} .sw[aria-pressed=true]{outline:2px solid var(--ink);outline-offset:2px}`;
+
+const filterFor = k => `<filter id="hand" x="-3%" y="-3%" width="106%" height="106%" color-interpolation-filters="sRGB">
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.045/k).toFixed(4)}" numOctaves="2" seed="4" result="warp"/>
+  <feDisplacementMap id="wob" in="SourceGraphic" in2="warp" scale="${(2.4*k).toFixed(2)}" xChannelSelector="R" yChannelSelector="G" result="wob"/>
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.9/k).toFixed(4)}" numOctaves="3" seed="11" result="n1"/>
+  <feColorMatrix in="n1" type="matrix" values=".3 0 0 0 .84  .3 0 0 0 .84  .3 0 0 0 .84  0 0 0 0 1" result="grain"/>
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.012/k).toFixed(4)}" numOctaves="2" seed="7" result="n2"/>
+  <feColorMatrix in="n2" type="matrix" values=".3 0 0 0 .85  .3 0 0 0 .85  .3 0 0 0 .85  0 0 0 0 1" result="blot"/>
+  <feBlend in="wob" in2="grain" mode="multiply" result="g1"/><feBlend in="g1" in2="blot" mode="multiply" result="g2"/>
+  <feComposite in="g2" in2="wob" operator="in"/></filter>`;
+
+/* mountFigure({
+     fig:'03', title:'Photo booth', hint:'click the curtain…',
+     size:[W,D,H],                 // bounding box, used to frame the view (shadow range included)
+     palette:'mustard',            // default PALS key
+     state:{...},                  // figure state (st.pal is built in)
+     scene: (st, m) => svgString,  // m = current palette {l,m,d}
+     readout: st => 'text',        // status line under the figure
+     buttons: [{label, onClick(st, ui)}      // listed in the order the user should do them
+               | {label, choices: st => [{label, onClick(st,ui), current?, disabled?, why?}]}],   // opens a picker
+     stats: st => [{label, value, small?}],   // optional: big numbers top-right (credit, change, score)
+     credit: false,                // optional: hide the small "Made with Colorfigures" link
+     acts: { name(st, el, ui){} },  // clicks on act(name, …) groups; el has dataset
+     params(st, q){}               // optional: read URLSearchParams for screenshot states
+   })  -> ui = { st, render, animate(stepFn), flash(text,ms) }
+   animate(step): calls step(dt seconds) every frame and re-renders until step returns false. */
+addEventListener('error', e => { document.documentElement.dataset.errors = (document.documentElement.dataset.errors || '') + ' ' + e.message + ';'; });
+function mountFigure(cfg){
+  document.title = cfg.title;
+  const style = document.createElement('style'); style.textContent = CORE_CSS; document.head.appendChild(style);
+  document.body.innerHTML = `
+    <header><h1>Fig. ${cfg.fig} — ${cfg.title}</h1><span>${cfg.hint || ''}</span></header>
+    <div class="stage">
+      ${cfg.buttons && cfg.buttons.length ? `<div class="actions" id="btns"><div class="cap">${cfg.buttonsLabel || 'Try it'}</div></div>` : ''}
+      ${cfg.stats ? '<div class="stats" id="stats"></div>' : ''}
+      <div class="toast" id="toast" role="status"></div>
+      <svg id="fig" role="img" aria-label="${cfg.title}"><defs id="fdefs"></defs><g id="art" filter="url(#hand)"></g></svg>
+    </div>
+    <div id="readout"></div>
+    ${cfg.idea ? `<p class="idea"><strong>The big idea</strong>${cfg.idea}</p>` : ''}
+    <div class="controls">
+      <div class="ctl"><label for="wb">Hand-drawn wobble</label><input id="wb" type="range" min="0" max="7" step="0.1" value="2.4"></div>
+      <div class="ctl"><label>Colour</label><div class="row" id="pals"></div></div>
+      <div class="ctl" id="lblctl" hidden><label>Labels</label><div class="row"><button id="lbl" aria-pressed="true">On</button></div></div>
+    </div>
+    ${cfg.credit === false ? '' : '<footer class="made-with"><a href="https://april-zhu.com/colorfigures" target="_blank" rel="noopener">Made with Colorfigures ↗</a></footer>'}`;
+  const st = cfg.state || {};            // kept as the same object, so a figure may hold on to it
+  if (!st.pal) st.pal = cfg.palette || 'mustard';
+  if (st.az == null) st.az = 105;
+  const q = new URLSearchParams(location.search);
+  if (PALS[q.get('pal')]) st.pal = q.get('pal');
+  if (cfg.params) cfg.params(st, q);
+
+  // frame on the object itself: centred, filling ~60% of the width / ~78% of the height of a 4:3 view.
+  // The cast shadow is allowed to spill outside the frame (svg overflow is visible).
+  const [W,D,H] = cfg.size, pts = [];
+  OX = OY = 0; RC = cfg.center || [W/2, D/2];
+  VIEW = 0;
+  for (const x of [0,W]) for (const y of [0,D]) for (const z of [0,H]) pts.push(P(x,y,z));
+  const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]);
+  const bw = Math.max(...xs)-Math.min(...xs), bh = Math.max(...ys)-Math.min(...ys);
+  // the object fills ~74% of the width / ~88% of the height, nudged right of centre so the buttons (top left) stay clear
+  const vbW = Math.max(bw/.74, bh/.88/.75), vbH = vbW*.75;
+  OX = (vbW-bw)/2 + vbW*.06 - Math.min(...xs); OY = vbH*.04 - Math.min(...ys);   // sit a little high: shadows fall downward
+  const svg = document.getElementById('fig');
+  svg.setAttribute('viewBox', `0 0 ${f(vbW)} ${f(vbH)}`);
+  INK_K = vbW / INK_REF_VB;
+  document.getElementById('fdefs').innerHTML = filterFor(INK_K);
+
+  const art = document.getElementById('art'), readout = document.getElementById('readout');
+  const ui = { st };
+  ui.render = () => { _clipN = 0; document.documentElement.style.setProperty('--accent', PALS[st.pal].l); art.innerHTML = inkScale(cfg.scene(st, PALS[st.pal])); if (!ui._flash) readout.textContent = cfg.readout ? cfg.readout(st) : ''; if (ui.drawStats) ui.drawStats(); };
+  // big numbers in the top-right corner (credit, change, score…); a value that changes gets a little bump
+  const statsEl = document.getElementById('stats'), prevStats = {};
+  ui.drawStats = () => { if (!statsEl) return;
+    const list = cfg.stats(st).filter(Boolean), html = list.map(x => `<div class="stat${x.small ? ' small' : ''}"><div class="k">${x.label}</div><div class="v" data-k="${x.label}">${x.value}</div></div>`).join('');
+    if (statsEl._html !== html){ statsEl._html = html; statsEl.innerHTML = html;
+      statsEl.querySelectorAll('.v').forEach(v => { if (prevStats[v.dataset.k] != null && prevStats[v.dataset.k] !== v.textContent) v.classList.add('bump'); prevStats[v.dataset.k] = v.textContent; }); } };
+  let flashT = 0;
+  const toast = document.getElementById('toast');
+  ui.flash = (text, ms=1600) => { ui._flash = true; readout.textContent = text; toast.textContent = text;
+    toast.style.top = ((document.getElementById('btns') ? document.getElementById('btns').offsetTop + document.getElementById('btns').offsetHeight : 0) + 8) + 'px'; toast.classList.add('show');
+    clearTimeout(flashT); flashT = setTimeout(() => { ui._flash = false; toast.classList.remove('show'); ui.render(); }, ms); };
+  // animations run on a ~60 fps timer rather than requestAnimationFrame, so they also run in headless test shots
+  ui.animate = step => { let last = performance.now();
+    const loop = () => { const now = performance.now(), dt = Math.max(0, Math.min(.05,(now-last)/1000)); last = now; const more = step(dt) !== false; ui.render(); if (more) setTimeout(loop, 16); };
+    setTimeout(loop, 16); };
+
+  // clickable parts react on press, not on click: while something animates, the scene is redrawn every frame, so the
+  // element under the pointer is replaced between press and release and a 'click' would never fire
+  svg.addEventListener('pointerdown', e => { if (e.button) return; const a = e.target.closest('[data-act]'); if (!a || !cfg.acts || !cfg.acts[a.dataset.act]) return;
+    e.preventDefault(); cfg.acts[a.dataset.act](st, a, ui); ui.render(); });
+  const btns = document.getElementById('btns');
+  const stepEls = [];
+  if (btns) cfg.buttons.forEach((b, i) => {
+    const wrap = document.createElement('div'); wrap.className = 'stepwrap';
+    const el = document.createElement('button'); el.className = 'act';
+    el.innerHTML = `${b.label}${b.choices ? '<span class="car">▾</span>' : ''}`;
+    wrap.appendChild(el); btns.appendChild(wrap); stepEls.push(el);
+    if (!b.choices){ el.onclick = () => { closeChips(); b.onClick(st, ui); ui.render(); }; return; }
+    const chips = document.createElement('div'); chips.className = 'chips'; wrap.appendChild(chips);
+    el.onclick = e => { e.stopPropagation(); const open = !wrap.classList.contains('open'); closeChips();
+      if (!open) return;
+      chips.innerHTML = '';
+      // every choice stays clickable, so nothing silently ignores a press:
+      //   current:true  = the one in use (shown selected); a press just says so
+      //   disabled:true = not possible right now (shown faded); a press says why (c.why, or a generic note)
+      for (const c of b.choices(st)){ const ch = document.createElement('button'); ch.className = 'chip' + (c.current ? ' current' : c.disabled ? ' off' : ''); ch.textContent = c.label;
+        if (c.current) ch.setAttribute('aria-pressed', 'true');
+        ch.onclick = ev => { ev.stopPropagation(); closeChips();
+          if (c.current) return ui.flash(`${c.label} — already set`);
+          if (c.disabled) return ui.flash(c.why || `${c.label} isn't possible right now`);
+          c.onClick(st, ui); ui.render(); }; chips.appendChild(ch); }
+      wrap.classList.add('open'); };
+  });
+  function closeChips(){ document.querySelectorAll('.stepwrap.open').forEach(w => w.classList.remove('open')); }
+  document.addEventListener('click', closeChips);
+
+  document.getElementById('wb').oninput = e => document.getElementById('wob').setAttribute('scale', (e.target.value * INK_K).toFixed(2));
+  const pals = document.getElementById('pals');
+  for (const [k,p] of Object.entries(PALS)){
+    const b = document.createElement('button'); b.className='sw'; b.title=k; b.style.background=p.l; b.setAttribute('aria-pressed', k===st.pal);
+    b.onclick = () => { st.pal=k; [...pals.children].forEach(c=>c.setAttribute('aria-pressed', c===b)); ui.render(); };
+    pals.appendChild(b);
+  }
+  // labels: the switch appears when the figure draws any tag(); ?labels=0 starts with them hidden
+  const lblctl = document.getElementById('lblctl'), lbl = document.getElementById('lbl');
+  const setLabels = on => { document.documentElement.classList.toggle('nolabels', !on); lbl.textContent = on ? 'On' : 'Off'; lbl.setAttribute('aria-pressed', on); };
+  lbl.onclick = () => setLabels(document.documentElement.classList.contains('nolabels'));
+  if (q.get('labels') === '0') setLabels(false);
+  // testing: ?press=Label@ms,Label@ms clicks the buttons whose text starts with Label at those times after load
+  // (any order, repeats allowed); Label>Choice picks a choice from a picker button (?press=Speed>3@300).
+  // Script errors and unknown labels are recorded on <html data-errors="…">
+  window.__st = st;
+  const noteErr = m => { document.documentElement.dataset.errors = (document.documentElement.dataset.errors || '') + ' ' + m + ';'; };
+  const starts = (el, t) => el.textContent.trim().toLowerCase().startsWith(t.trim().toLowerCase());
+  if (q.has('press')) q.get('press').split(',').forEach(item => { const [what, ms] = item.split('@'), [label, choice] = what.split('>');
+    setTimeout(() => { const b = [...document.querySelectorAll('.act')].find(b => starts(b, label));
+      if (!b) return noteErr(`no button "${label}"`);
+      b.click(); if (choice == null) return;
+      const c = [...b.parentElement.querySelectorAll('.chip')].find(c => starts(c, choice));
+      if (c && !c.disabled) c.click(); else noteErr(`no choice "${choice}" in "${label}"`); }, +ms || 0); });
+  setLight(st.az); ui.render();
+  if (art.querySelector('.tag')) lblctl.hidden = false;
+  return ui;
+}
+
+</script>
+<script>
+/* ============ How an LLM works ============
+   Real process: type a prompt -> the tokenizer slot chops it into tokens -> tokens become
+   embedding cubes on a rack -> a forward pass lifts them through the transformer tower
+   (attention lines flash per layer) -> the softmax screen shows candidate bars -> sampling
+   drops the chosen token on the output rail and feeds it back into the context (the loop). */
+
+/* ---------- geometry (x = depth, y = width, z = up) ---------- */
+const Z0 = 3;                                            // board top: everything stands on it
+const MW = 40, MD = 108, MH = 42;                        // cabinet: depth, width, height
+const OUTP = rrUV(0, Z0, MD, MH + Z0, 7);                // cabinet profile in (y,z)
+const TWR = { x0: 10, x1: 32, y0: 28, y1: 72, z0: 45, z1: 99 };   // transformer tower
+const FLRS = [51, 67, 83];                               // tower floor z (cube bases)
+const HEAD = { x0: 16, x1: 26, y0: 38, y1: 62, z0: 99, z1: 107 };  // the output head
+const SLOT = { y0: 85, y1: 103, z0: 23, z1: 29 };        // tokenizer slot (front face)
+const RACK = { y0: 28, y1: 80, z0: 9, z1: 37, d: 8 };    // embedding rack recess
+const NUB = 7, CUB = 6.5;                                // cubbies, cube size
+const cubY = i => RACK.y0 + 4 + i * (RACK.y1 - RACK.y0 - 8) / (NUB - 1);
+const cubZ = RACK.z0 + 0.6, cubX = MW - RACK.d + 0.5;    // cube base z / back x in the rack
+const SCRN = { y0: 4, y1: 26, z0: 25, z1: 37 };          // softmax screen (raised bezel)
+const CHUT = { y0: 7, y1: 23, z0: 12, z1: 18 };          // output chute (hole)
+const RAIL = { y0: 2, y1: 30 };                          // output rail on the board
+const railY = i => RAIL.y0 + 5 + i * 4.6;
+const BRD = { x0: -8, x1: 66, y0: -8, y1: 116, h: Z0, r: 6 };
+const twY = i => 34 + (cubY(i) - RACK.y0) * (66 - 34) / (80 - 28);   // rack y -> tower y
+
+const TCOL = ['#3e86d9', '#e2473a', '#f2c230', '#38a65d', '#d94f86', '#8a63d2', '#2fb3a8', '#e2762d'];
+const tokCol = w => { let h = 0; for (const c of w) h = (h * 31 + c.charCodeAt(0)) % 997; return TCOL[h % 8]; };
+const fsFor = w => w.length <= 3 ? 2.5 : w.length <= 5 ? 1.9 : 1.5;
+
+const PROMPTS = [
+  { name: 'The cat…',   words: ['The', 'cat', 'sat', 'on', 'the'],
+    chain: [ [['mat', .62], ['floor', .21], ['bed', .09]],
+             [['.', .44], ['and', .31], ['all', .12]] ] },
+  { name: 'Once upon…', words: ['Once', 'upon', 'a'],
+    chain: [ [['time', .71], ['dream', .12], ['hill', .08]],
+             [['there', .40], ['a', .30], ['long', .15]] ] },
+  { name: 'Jakarta…',   words: ['Ja', 'karta', 'is', 'the'],
+    chain: [ [['cap', .58], ['town', .22], ['wet', .09]],
+             [['ital', .66], ['of', .14], ['old', .10]] ] },
+];
+const MAXGEN = 2;
+const predsFor = st => PROMPTS[st.pi].chain[Math.min(st.gen, PROMPTS[st.pi].chain.length - 1)];
+
+/* ---------- small helpers ---------- */
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => { const k = Math.min(1, Math.max(0, (t - a) / ((b - a) || 1e-9))); return k * k * (3 - 2 * k); };
+const qbez = (a, b, c, t) => { const u = 1 - t; return [u*u*a[0]+2*u*t*b[0]+t*t*c[0], u*u*a[1]+2*u*t*b[1]+t*t*c[1], u*u*a[2]+2*u*t*b[2]+t*t*c[2]]; };
+const arcTo = (a, b, lift, t) => qbez(a, [(a[0]+b[0])/2, (a[1]+b[1])/2, Math.max(a[2], b[2]) + lift], b, ease(t));
+function tick(ui, fn){ let last = performance.now();
+  ui.animate(() => { const n = performance.now(), dt = Math.min(.05, Math.max(0, (n - last) / 1000)); last = n; return fn(dt); }); }
+
+/* a token cube (embedding) */
+function cube(ctr, col, word, scale=1){
+  const s = CUB * scale, h = s / 2, m = matOf(col);
+  let out = box(ctr[0] - h, ctr[1] - h, ctr[2] - h, ctr[0] + h, ctr[1] + h, ctr[2] + h, m, tone, .8);
+  out += tx(ctr[0] + h + .12, ctr[1], ctr[2] + s * .12, word, fsFor(word) * scale, INK, 800);
+  return out;
+}
+
+/* ============ cabinet pieces ============ */
+/* the paper tape: current context words, hanging from the tokenizer slot */
+function tape(st){
+  if (st.tapeGone) return '';
+  const n = st.words.length, X = MW + 0.4;
+  const offs = st.anim && st.anim.k === 'tok'
+    ? st.words.map((w, i) => 3.6 * (i + 1) * seg(st.anim.t, st.anim.ts[i], st.anim.ts[i] + 0.2)) : st.words.map(() => 0);
+  const top = Math.min(SLOT.z0, 5.5 + n * 3.6 + (offs[n-1] || 0));
+  let s = '';
+  const paper = on(PX(X), rectUV(SLOT.y0 + .6, 5, SLOT.y1 - .6, Math.max(6.5, top)));
+  s += shape(paper, '#fbf7ea', 1.2);
+  for (let i = 0; i < n; i++){
+    const z = 6.5 + i * 3.6 + offs[i]; if (z > SLOT.z0 - 1.5) continue;
+    s += tx(X + .25, (SLOT.y0 + SLOT.y1) / 2, z, st.words[i], Math.min(3, 15 / st.words[i].length), INK, 700);
+  }
+  s += clipTo(on(PX(X), rectUV(SLOT.y0, 4, SLOT.y1, SLOT.z0)), '');   // no-op clip keeps ids stable
+  return s;
+}
+
+/* the tokenizer slot (mouth with teeth) */
+function slotMouth(){
+  let s = fill(pd(on(PX(MW + .2), rectUV(SLOT.y0, SLOT.z0, SLOT.y1, SLOT.z1))), '#241f19');
+  let teeth = '';
+  for (let y = SLOT.y0 + 1.6; y < SLOT.y1 - 1; y += 2.2)
+    teeth += pd([[MW + .25, y, SLOT.z0], [MW + .25, y + 1, SLOT.z0 + 1.4], [MW + .25, y + 2, SLOT.z0]], false);
+  s += `<path d="${teeth}" fill="none" stroke="${INK}" stroke-width=".9" stroke-linecap="round"/>`;
+  return s;
+}
+
+/* the embedding rack: an open recess with cubbies, cubes stand inside */
+function rackInterior(st){
+  let s = '';
+  const back = on(PX(MW - RACK.d), rectUV(RACK.y0, RACK.z0, RACK.y1, RACK.z1));
+  s += fill(pd(back), mix(tone([1,0,0], METAL), '#000000', .38));
+  s += shape(on(PY(RACK.y0), [[MW - RACK.d, RACK.z0, RACK.z1 - 0], [MW, RACK.z0, RACK.z1 - 0], [MW, RACK.z0, RACK.z0], [MW - RACK.d, RACK.z0, RACK.z0]]), mix(tone([1,0,0], METAL), '#000000', .18), .9);
+  s += fill(pd(on(PZ(RACK.z0), rectUV(MW - RACK.d, RACK.y0, MW, RACK.y1))), tone([0,0,1], METAL));
+  // cubby dividers
+  for (let i = 1; i < NUB; i++){
+    const y = (cubY(i - 1) + cubY(i)) / 2;
+    s += shape([[MW - RACK.d, y, RACK.z0], [MW - RACK.d, y, RACK.z1 - 2], [MW, y, RACK.z1 - 2], [MW, y, RACK.z0]], '#8f989b', .7);
+  }
+  // idle cubes
+  if (st.loaded && !(st.anim && st.anim.k === 'fwd' && st.anim.t < 0.97))
+    st.words.forEach((w, i) => { s += cube([cubX + CUB/2, cubY(i), cubZ + CUB/2], tokCol(w), w); });
+  return s;
+}
+function rackFront(m){
+  const hole = rectUV(RACK.y0, RACK.z0, RACK.y1, RACK.z1);
+  let s = `<path d="${pd(on(PX(MW), hole))}" fill="${tone([1,0,0], m)}"/>`;
+  s += ink(pd(on(PX(MW), hole)), 1.6);
+  return s;
+}
+
+/* the softmax screen + indicator light */
+function screen(st){
+  let s = shape(on(PX(MW + .25), rrUV(SCRN.y0 - 1.5, SCRN.z0 - 1.5, SCRN.y1 + 1.5, SCRN.z1 + 1.5, 2)), METAL.m, 1.1);
+  s += shape(on(PX(MW + .55), rrUV(SCRN.y0, SCRN.z0, SCRN.y1, SCRN.z1, 1.5)), '#1d2a26', 1);
+  if (st.preds){
+    st.preds.forEach((p, i) => {
+      const z = SCRN.z1 - 4 - i * 3.6, [w, pr] = p;
+      const hot = st.anim && st.anim.k === 'drop' && st.anim.pick === w;
+      const flash = hot ? (Math.sin(st.anim.t * 26) > 0 ? 1 : .35) : 1;
+      s += tx(MW + .6, SCRN.y0 + 4.5, z, w, 2.3, '#8af0ae', 800);
+      s += fill(pd(on(PX(MW + .6), rectUV(SCRN.y0 + 9.5, z - 1.2, SCRN.y0 + 9.5 + 11.5 * pr, z + 1.2))), hot ? '#d9ffe3' : '#8af0ae', `opacity="${f(flash)}"`);
+    });
+  } else if (st.loaded){
+    s += tx(MW + .6, (SCRN.y0 + SCRN.y1) / 2, SCRN.z0 + 4.6, '_ _ _', 3, '#8af0ae', 700);
+  } else {
+    s += tx(MW + .6, (SCRN.y0 + SCRN.y1) / 2, SCRN.z0 + 4.6, 'READY', 2.6, '#5c7a68', 800);
+  }
+  const lit = st.preds ? '#43c25c' : (st.anim ? '#f2b431' : '#575246');
+  s += fill(pd(on(PX(MW + .3), ellUV(15, SCRN.z1 + 4.5, 1.5, 1.5, 14))), lit) + ink(pd(on(PX(MW + .3), ellUV(15, SCRN.z1 + 4.5, 1.5, 1.5, 14))), .8);
+  return s;
+}
+
+/* chute + sampling lever */
+function chuteAndLever(){
+  let s = fill(pd(on(PX(MW + .2), rectUV(CHUT.y0, CHUT.z0, CHUT.y1, CHUT.z1))), '#241f19');
+  s += ink(pd(on(PX(MW + .2), rectUV(CHUT.y0, CHUT.z0, CHUT.y1, CHUT.z1))), 1.3);
+  let lv = cylX(MW + .2, MW + 2.4, 15, 22, 1.5, METAL, toneI, 1.1, 18);
+  lv += rod([MW + 2.4, 15, 22], [MW + 5.8, 15, 28.5], .85, matOf('#e2483d'), toneI, 1);
+  lv += fill(pd(on(PX(MW + 5.9), ellUV(15, 28.5, 1.1, 1.1, 12))), '#f4b829') + ink(pd(on(PX(MW + 5.9), ellUV(15, 28.5, 1.1, 1.1, 12))), .7);
+  return s + act('lever', lv);
+}
+
+/* output rail: generated tokens stand in a row */
+function rail(st){
+  let s = box(56, RAIL.y0, Z0, 58, RAIL.y1, Z0 + 9, METAL, toneI, .9);      // back wall
+  s += box(44, RAIL.y0, Z0, 58, RAIL.y0 + 1.2, Z0 + 1.8, METAL, toneI, .9); // rim front-left
+  s += box(44, RAIL.y1 - 1.2, Z0, 58, RAIL.y1, Z0 + 1.8, METAL, toneI, .9); // rim right
+  s += fill(pd(on(PZ(Z0 + .05), rectUV(44, RAIL.y0, 58, RAIL.y1))), tone([0,0,1], METAL));
+  st.genChips.forEach((c, i) => {
+    const y = railY(i);
+    s += box(53.4, y - 2.8, Z0 + 1.5, 54.2, y + 2.8, Z0 + 8, matOf(c.col), toneI, .8);
+    s += tx(54.35, y, Z0 + 3.4, c.w, fsFor(c.w), INK, 800);
+  });
+  return s;
+}
+
+/* the feedback arrow on the board: rail -> back into the tokenizer slot */
+function loopArrow(st){
+  const pts = [[48, 6, Z0 + .15], [54, 34, Z0 + .15], [50, 68, Z0 + .15], [43.5, 92, Z0 + .15]];
+  let s = ink(pd(pts, false), 1.3);
+  s += fill(pd([[43.5, 92, Z0 + .15], [46.5, 90.5, Z0 + .15], [45.2, 87.6, Z0 + .15]]), INK);
+  if (st.anim && st.anim.k === 'drop' && st.anim.t > 0.45)
+    s += `<path d="${pd(pts, false)}" fill="none" stroke="${PALS[st.pal].l}" stroke-width="2.2" stroke-dasharray="2 5" stroke-dashoffset="${f(-st.anim.t * 90)}" stroke-linecap="round"/>`;
+  return s;
+}
+
+/* ============ the transformer tower ============ */
+function tower(st){
+  const { x0, x1, y0, y1, z0, z1 } = TWR;
+  let inner = '';
+  // base plate + floor plates
+  inner += box(x0 - 2, y0 - 2, z0 - 3, x1 + 2, y1 + 2, z0, METAL, tone, .9);
+  for (const fz of FLRS) inner += shape(on(PZ(fz - .7), rectUV(x0 + .8, y0 + .8, x1 - .8, y1 - .8)), METAL.m, .7);
+  // the head on top
+  inner += box(HEAD.x0, HEAD.y0, HEAD.z0, HEAD.x1, HEAD.y1, HEAD.z1, DARK, toneI, 1);
+  const ready = !!st.preds || (st.anim && st.anim.k === 'fwd' && st.anim.t > 0.93);
+  inner += fill(pd(on(PX(HEAD.x1 + .1), ellUV(21, 103, 2, 2, 16))), ready ? '#43c25c' : '#3d3935') + ink(pd(on(PX(HEAD.x1 + .1), ellUV(21, 103, 2, 2, 16))), .9);
+  inner += rod([21, 50, HEAD.z1], [21, 50, HEAD.z1 + 6], .5, METAL, toneI, .8) + fill(pd(on(PZ(HEAD.z1 + 6.2), ellUV(21, 50, 1.1, 1.1, 10))), '#e2483d');
+
+  // cubes inside during a forward pass + attention lines
+  let cubes = '', lines = '';
+  if (st.anim && st.anim.k === 'fwd'){
+    const t = st.anim.t, n = st.words.length;
+    const PH = [[0, .16], [.18, .36], [.38, .52], [.54, .70], [.72, .86], [.88, .93]];
+    for (let i = 0; i < n; i++){
+      const w = st.words[i], col = tokCol(w);
+      let pos;
+      if (t < PH[0][1]) pos = arcTo([cubX + CUB/2, cubY(i), cubZ + CUB/2], [21, twY(i), FLRS[0] + CUB/2], 14, seg(t, 0, .16));
+      else if (t < PH[1][1]) pos = [21, twY(i), FLRS[0] + CUB/2];
+      else if (t < PH[2][1]) pos = [21, twY(i), lerp(FLRS[0], FLRS[1], seg(t, .38, .52)) + CUB/2];
+      else if (t < PH[3][1]) pos = [21, twY(i), FLRS[1] + CUB/2];
+      else if (t < PH[4][1]) pos = [21, twY(i), lerp(FLRS[1], FLRS[2], seg(t, .72, .86)) + CUB/2];
+      else pos = [21, twY(i), FLRS[2] + CUB/2];
+      cubes += cube(pos, col, w, .92);
+    }
+    const floors = [[PH[1][0], PH[1][1], 0], [PH[3][0], PH[3][1], 1], [PH[5][0], PH[5][1], 2]];
+    for (const [a, b, k] of floors){
+      if (t < a || t > b + .06) continue;
+      const fk = ease(Math.min(1, Math.max(0, (t - a) / (b - a))));
+      const fade = t > b ? 1 - (t - b) / .06 : fk;
+      for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++){
+        const wgt = 1 / (1 + Math.abs(i - j) * .8);
+        lines += `<path d="${pd([[21, twY(i), FLRS[k] + CUB], [21, twY(j), FLRS[k] + CUB]], false)}" fill="none" stroke="${PALS[st.pal].l}" stroke-width="${f(1.6 * wgt + .5)}" opacity="${f(.85 * fade * wgt)}" stroke-linecap="round"/>`;
+      }
+    }
+  }
+  // glass panes over the contents, then posts
+  let s = inner + cubes;
+  if (lines) s += lines;
+  const front = on(PX(x1), rectUV(y0, z0, y1, z1)), left = on(PY(y1), rectUV(x0, z0, x1, z1));
+  s += fill(pd(front), '#cfe9f0', 'opacity=".14"') + fill(pd(left), '#cfe9f0', 'opacity=".11"');
+  const st1 = [[y0 + 8, z0 + 6], [y0 + 14, z0 + 6], [y1 - 10, z1 - 8], [y1 - 16, z1 - 8]].map(([u, v]) => [x1, u, v]);
+  s += clipTo(front, fill(pd(st1), '#ffffff', 'opacity=".3"'));
+  for (const [cx, cy] of [[x0, y0], [x0, y1], [x1, y0], [x1, y1]])
+    s += cyl(cx, cy, z0, z1, 1.1, METAL, tone, .9, 12);
+  s += hullInk([...on(PZ(z0), rectUV(x0, y0, x1, y1)), ...on(PZ(z1), rectUV(x0, y0, x1, y1))], 2.2);
+  return s;
+}
+
+/* side decal */
+function sideDecal(m){
+  if (!facing([0, 1, 0])) return '';
+  const sm = tone([0, 1, 0], m), tc = sm === m.l ? m.m : sm;
+  let s = txY(MW / 2 - 4, MD + .3, 28, 'LLM-7B', 6, tc, 800);
+  s += txY(MW / 2 - 4, MD + .3, 20, 'AUTO-REGRESSIVE', 2.6, tc, 700);
+  let v = ''; for (const z of [8, 11.5, 15]) v += pd([[8, MD + .25, Z0 + z], [MW - 8, MD + .25, Z0 + z]], false);
+  s += `<path d="${v}" fill="none" stroke="${INK}" stroke-width="1.2" stroke-linecap="round" opacity=".55"/>`;
+  return s;
+}
+
+/* chips in motion (byDepth parts) */
+function flyingChips(st){
+  const parts = [];
+  const a = st.anim;
+  if (a && a.k === 'tok'){
+    st.words.forEach((w, i) => {
+      const p = seg(a.t, a.ts[i], a.ts[i] + 0.22);
+      if (p <= 0 || p >= 1) return;
+      const pos = arcTo([MW + 1, 94, SLOT.z0 + 1], [cubX + CUB/2, cubY(i), cubZ + CUB/2], 12, p);
+      parts.push({ at: pos, svg: cube(pos, tokCol(w), w, .9) });
+    });
+  }
+  if (a && a.k === 'fwd' && a.t < 0.16){
+    st.words.forEach((w, i) => {
+      const p = seg(a.t, 0, 0.16); if (p >= 1) return;
+      const pos = arcTo([cubX + CUB/2, cubY(i), cubZ + CUB/2], [21, twY(i), FLRS[0] + CUB/2], 14, p);
+      parts.push({ at: pos, svg: cube(pos, tokCol(w), w, .92) });
+    });
+  }
+  if (a && a.k === 'fwd' && a.t > 0.93){
+    st.words.forEach((w, i) => {
+      const p = seg(a.t, 0.93, 1);
+      const pos = arcTo([21, twY(i), FLRS[2] + CUB/2], [cubX + CUB/2, cubY(i), cubZ + CUB/2], 10, p);
+      if (p < 1) parts.push({ at: pos, svg: cube(pos, tokCol(w), w, .92) });
+    });
+  }
+  if (a && a.k === 'drop'){
+    const col = tokCol(a.pick);
+    if (a.t < 0.4){                                   // falls from the chute to the rail
+      const p = seg(a.t, 0, 0.4);
+      const pos = arcTo([MW + 1, 15, CHUT.z0], [53.8, railY(st.genChips.length), Z0 + 5], 4, p);
+      parts.push({ at: pos, svg: cube(pos, col, a.pick, .9) });
+    } else if (a.t < 0.95){                            // rides the loop back into the slot, then to its cubby
+      const p = seg(a.t, 0.45, 0.95);
+      if (p > 0 && p < 1){
+        const path = [[53.8, railY(st.genChips.length), Z0 + 5], [46, railY(st.genChips.length) + 2, Z0 + 16], [42, 90, SLOT.z0 + 2], [MW + 1, 94, SLOT.z0 + 1]];
+        const segm = Math.min(.999, p * 3), i2 = Math.floor(segm), lt = segm - i2;
+        const pos = qbez(path[Math.min(i2, 2)], path[Math.min(i2, 2) + 1], path[Math.min(i2 + 1, 3)], lt);
+        parts.push({ at: pos, svg: cube(pos, col, a.pick, .9) });
+      }
+    }
+  }
+  return parts;
+}
+
+/* ============ scene ============ */
+function scene(st, m){
+  let s = '';
+  // shadows
+  s += castShadow([...on(PZ(Z0), rectUV(0, 0, MW, MD)), ...on(PZ(45), rectUV(8, 24, 34, 76))], Z0, boardTop(BRD.x0, BRD.y0, BRD.x1, BRD.y1, Z0, BRD.r));
+  s += castShadow([...on(PZ(Z0), rectUV(44, RAIL.y0, 58, RAIL.y1))], Z0, boardTop(BRD.x0, BRD.y0, BRD.x1, BRD.y1, Z0, BRD.r));
+  s += board(BRD.x0, BRD.y0, BRD.x1, BRD.y1, Z0, BRD.r);
+  s += loopArrow(st);
+
+  // feet + cabinet body
+  for (const [x, y] of [[5, 5], [5, MD - 5], [MW - 5, 5], [MW - 5, MD - 5]]) s += cyl(x, y, Z0 - 2.6, Z0 + .5, 2.4, DARK, toneI, .9, 14);
+  const slotHole = rectUV(SLOT.y0, SLOT.z0, SLOT.y1, SLOT.z1);
+  const rackHole = rectUV(RACK.y0, RACK.z0, RACK.y1, RACK.z1);
+  const chutHole = rectUV(CHUT.y0, CHUT.z0, CHUT.y1, CHUT.z1);
+  s += `<path d="${pd(on(PX(MW), OUTP))}${pd(on(PX(MW), rackHole))}${pd(on(PX(MW), slotHole))}${pd(on(PX(MW), chutHole))}" fill="${tone([1,0,0], m)}" fill-rule="evenodd"/>`;
+  s += hullInk([...on(PX(0), OUTP), ...on(PX(MW), OUTP)], 2.8);
+  s += ink(pd(on(PX(MW), rackHole)), 1.6) + ink(pd(on(PX(MW), chutHole)), 1.2);
+
+  // interiors behind the front face
+  s += rackInterior(st);
+  s += rackFront(m);
+  s += slotMouth();
+  s += screen(st);
+  s += chuteAndLever();
+
+  // tower, side decal, tape
+  s += tower(st);
+  s += sideDecal(m);
+  const parts = [
+    { at: [MW + 1, 94, 12], svg: tape(st) },
+    { at: [51, (RAIL.y0 + RAIL.y1) / 2, Z0 + 4], svg: rail(st) },
+    ...flyingChips(st),
+  ];
+  s += byDepth(parts);
+
+  // part labels (on = the part is doing its job right now)
+  const tok = st.anim && st.anim.k === 'tok', fwd = st.anim && st.anim.k === 'fwd', drp = st.anim && st.anim.k === 'drop';
+  s += tag([MW + .5, 94, 10], -78, -6, 'PROMPT', tok);
+  s += tag([MW + .2, 94, SLOT.z0 + 3], -66, -52, 'TOKENIZER', tok);
+  s += tag([MW + .2, 54, RACK.z0 + 2], -48, 34, 'EMBEDDING', tok);
+  s += tag([21, 72, FLRS[2] + 8], -74, -38, 'ATTENTION', fwd);
+  s += tag([MW + .3, 15, SCRN.z0 + 6], 52, -40, 'SOFTMAX', !!st.preds);
+  s += tag([54, 8, Z0 + 5], 62, 16, 'NEXT TOKEN', drp);
+  return s;
+}
+
+/* ============ behaviour ============ */
+let ui;
+function startTok(st){
+  if (st.anim) return ui.flash('the machine is busy — wait for it');
+  if (st.loaded) return ui.flash('tokens are already on the rack — run a forward pass');
+  const n = st.words.length;
+  st.anim = { k: 'tok', t: 0, T: 1, ts: st.words.map((w, i) => 0.1 + i * (0.62 / n)) };
+  tick(ui, (dt) => {
+    st.anim.t += dt;
+    if (st.anim.t >= 1){ st.loaded = true; st.anim = null; ui.flash('tokenized — ' + n + ' tokens on the rack'); return false; }
+    return true;
+  });
+}
+function startFwd(st){
+  if (st.anim) return ui.flash('the machine is busy — wait for it');
+  if (!st.loaded) return ui.flash('the rack is empty — tokenize the prompt first');
+  if (st.preds) return ui.flash('prediction already shown — sample the next token');
+  if (st.gen >= MAXGEN) return ui.flash('context window is full — press reset');
+  st.anim = { k: 'fwd', t: 0, T: 1 };
+  tick(ui, (dt) => {
+    st.anim.t += dt;
+    if (st.anim.t >= 1){
+      st.preds = predsFor(st); st.anim = null;
+      ui.flash('prediction ready — pull the lever or press sample'); return false;
+    }
+    return true;
+  });
+}
+function weightedPick(preds){
+  let r = Math.random();
+  for (const [w, p] of preds){ r -= p; if (r <= 0) return w; }
+  return preds[0][0];
+}
+function startDrop(st){
+  if (st.anim) return ui.flash('the machine is busy — wait for it');
+  if (!st.preds) return ui.flash('run a forward pass first');
+  const pick = weightedPick(st.preds);
+  st.anim = { k: 'drop', t: 0, T: 1, pick };
+  st.picked = pick;
+  tick(ui, (dt) => {
+    st.anim.t += dt;
+    if (st.anim.t >= 0.4 && !st.anim.appended){
+      st.anim.appended = true;
+      st.genChips.push({ w: pick, col: tokCol(pick) });
+      st.words.push(pick); st.gen++; st.loaded = true; st.preds = null;
+    }
+    if (st.anim.t >= 1){
+      st.anim = null; st.tapeGone = false;
+      ui.flash('"' + pick + '" added to the context — forward pass to predict again'); return false;
+    }
+    return true;
+  });
+}
+function reset(st){
+  if (st.anim) return ui.flash('the machine is busy — wait for it');
+  st.words = PROMPTS[st.pi].words.slice(); st.gen = 0; st.loaded = false; st.preds = null;
+  st.genChips = []; st.picked = null; st.tapeGone = false;
+  ui.flash('prompt retyped — tokenize to start again');
+}
+
+const st0 = { pi: 0, words: PROMPTS[0].words.slice(), gen: 0, loaded: false, preds: null, genChips: [], picked: null, tapeGone: false, anim: null };
+
+ui = mountFigure({
+  fig: '02', title: 'How an LLM works', hint: 'type a prompt, tokenize, forward pass, sample — the token loops back in',
+  idea: 'An LLM chops text into tokens, turns each into a vector, mixes their meaning across layers with attention, then picks the next token from probabilities — and feeds it back in, one token at a time.',
+  size: [64, 116, 110], palette: 'cobalt',
+  state: st0,
+  scene,
+  readout: st => {
+    if (st.anim) return { tok: 'tokenizing — the slot chops the tape into tokens', fwd: 'forward pass — attention is mixing the tokens across layers', drop: 'sampling — the chosen token loops back into the context' }[st.anim.k];
+    if (st.preds) return 'prediction ready — sample the next token';
+    if (st.loaded) return 'tokens on the rack — press forward pass';
+    return 'a prompt is typed on the tape — press tokenize';
+  },
+  buttons: [
+    { label: 'Type prompt', choices: st => PROMPTS.map((p, i) => ({
+        label: p.name, current: st.pi === i && st.gen === 0 && !st.loaded,
+        disabled: st.loaded || st.gen > 0, why: 'the machine still holds tokens — press reset first',
+        onClick: (st, ui) => { st.pi = i; st.words = p.words.slice(); st.preds = null; } })) },
+    { label: 'Tokenize', onClick: startTok },
+    { label: 'Forward pass', onClick: startFwd },
+    { label: 'Sample next token', onClick: startDrop },
+    { label: 'Reset', onClick: reset },
+  ],
+  buttonsLabel: 'Pipeline',
+  acts: { lever: (st, el, ui2) => startDrop(st, ui2) },
+  stats: st => [
+    { label: 'context', value: st.words.length + ' tok' },
+    { label: 'next', value: st.picked || '—', small: true },
+  ],
+  params: (st, q) => {
+    const pi = +q.get('pi'); if (pi >= 0 && pi < PROMPTS.length){ st.pi = pi; st.words = PROMPTS[pi].words.slice(); }
+    const g = +q.get('gen'); if (g > 0){
+      for (let k = 0; k < Math.min(g, MAXGEN); k++){
+        const w = PROMPTS[st.pi].chain[Math.min(k, PROMPTS[st.pi].chain.length - 1)][0][0];
+        st.words.push(w); st.genChips.push({ w, col: tokCol(w) }); st.gen++;
+      }
+      st.loaded = true;
+    }
+    if (q.get('stage') === 'rack') st.loaded = true;
+    if (q.get('stage') === 'ready'){ st.loaded = true; st.preds = predsFor(st); }
+    if (q.get('tok') === '1') st.anim = { k: 'tok', t: +q.get('t') || .3, T: 1, ts: st.words.map((w, i) => 0.1 + i * (0.62 / st.words.length)) };
+    if (q.get('fwd') === '1') st.anim = { k: 'fwd', t: +q.get('t') || .3, T: 1 };
+    if (q.get('drop') === '1'){ st.preds = st.preds || predsFor(st); st.anim = { k: 'drop', t: +q.get('t') || .2, T: 1, pick: (st.preds[0] && weightedPick(st.preds)) || 'mat' }; }
+  },
+});
+</script></body></html>
